@@ -1,0 +1,152 @@
+name: Check for WIZ CFN Updates
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - CFN_Template/**
+  schedule:
+    - cron: '0 0 * * 0' # Runs Weekly on Sunday at midnight
+  workflow_dispatch: #allows manual trigger
+    
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+
+jobs:
+  wiz_integration_mgmt:
+    name: Check Wiz CFN templates for updates
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    defaults:
+      run:
+        shell: bash
+        working-directory: CFN_Template
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3.3.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16'
+      - name: Install/Update AWS CLI
+        run: |
+          curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+          unzip -qo /tmp/awscliv2.zip -d /tmp
+          sudo /tmp/aws/install --update || true
+          rm -rf /tmp/awscliv2.zip /tmp/aws
+          aws --version
+      - name: Download the latest CFN template
+        run: curl -o downloaded.json https://wizio-public.s3.amazonaws.com/deployment-v2/aws/wiz-aws-standard-org.json
+
+      - name: Compare new CFN template against deployed one
+        id: compare
+        run: |
+          if jq -S . downloaded.json > normalized_downloaded.json && \
+             jq -S . wiz-aws-standard-org.json > normalized_existing.json && \
+             ! diff -q normalized_downloaded.json normalized_existing.json > /dev/null; then
+            echo "CHANGED=true" >> $GITHUB_ENV
+          else
+            echo "CHANGED=false" >> $GITHUB_ENV
+          fi
+      - name: Update JSON file and commit changes
+        if: env.CHANGED == 'true'
+        run: |
+          cp downloaded.json wiz-aws-standard-org.json
+          rm -rf downloaded.json normalized_downloaded.json normalized_existing.json
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "${{ github.actor }}@users.noreply.github.com"
+          git add wiz-aws-standard-org.json
+          git commit -m "Update JSON file"
+      - name: Create a branch and Pull Request
+        if: env.CHANGED == 'true'
+        uses: create-pull-request@main
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          title: 'Update Wiz CFN Template file'
+          body: 'This PR updates the CFN template file with the latest version for the Wiz integration.'
+          reviewers: cyberviking949
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3.3.0
+
+      - name: Install/Update AWS CLI
+        run: |
+          curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+          unzip -qo /tmp/awscliv2.zip -d /tmp
+          sudo /tmp/aws/install --update || true
+          rm -rf /tmp/awscliv2.zip /tmp/aws
+          aws --version
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: 'us-east-1'
+          role-to-assume: ${{ secrets.AWS_ROLE }}
+          role-duration-seconds: 3600
+
+      - name: Update StackSet
+        run: |
+          aws cloudformation update-stack-set \
+            --stack-set-name Wiz-io-SaaS-Connector \
+            --region us-east-1 \
+            --no-use-previous-template \
+            --template-url https://wizio-public.s3.amazonaws.com/deployment-v2/aws/wiz-aws-standard-org.json \
+            --capabilities CAPABILITY_NAMED_IAM CAPABILITY_IAM \
+            --parameters ParameterKey=ExternalId,UsePreviousValue=true \
+                         ParameterKey=RoleARN,UsePreviousValue=true \
+                         ParameterKey=WizRoleName,UsePreviousValue=true \
+                         ParameterKey=DataScanning,ParameterValue=Enabled \
+                         ParameterKey=EKSScanning,ParameterValue=Enabled \
+                         ParameterKey=LightsailScanning,ParameterValue=Enabled \
+                         ParameterKey=S3AWSLogsScanning,ParameterValue=Enabled \
+                         ParameterKey=RDSLogsScanning,ParameterValue=Enabled \
+                         ParameterKey=S3KMSDecrypt,ParameterValue=Enabled \
+                         ParameterKey=TerraformBucketScanning,ParameterValue=Enabled \
+                         ParameterKey=CloudCostScanning,ParameterValue=Enabled \
+                         ParameterKey=S3InventoryScanning,ParameterValue=Disabled \
+                         ParameterKey=WizPolicyNameSuffix,ParameterValue="" \
+                         ParameterKey=PermissionBoundaryPolicyName,ParameterValue="" \
+                         ParameterKey=WizVersionLastUpdated,ParameterValue=2026-04-01 \
+            --operation-preferences FailureTolerancePercentage=100,MaxConcurrentCount=100,ConcurrencyMode=SOFT_FAILURE_TOLERANCE
+
+      - name: Create CloudFormation Change Set
+        run: |
+          CHANGE_SET=$(aws cloudformation create-change-set \
+            --stack-name Wiz-io-SaaS-Connector \
+            --region us-east-1 \
+            --change-set-name UpdateIntegration \
+            --no-use-previous-template \
+            --template-url https://wizio-public.s3.amazonaws.com/deployment-v2/aws/wiz-aws-standard-org.json \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameters ParameterKey=ExternalId,UsePreviousValue=true \
+                         ParameterKey=RoleARN,UsePreviousValue=true \
+                         ParameterKey=isOrg,UsePreviousValue=true \
+                         ParameterKey=orgId,UsePreviousValue=true \
+                         ParameterKey=WizRoleName,UsePreviousValue=true \
+                         ParameterKey=DataScanning,UsePreviousValue=true \
+                         ParameterKey=EKSScanning,UsePreviousValue=true \
+                         ParameterKey=LightsailScanning,UsePreviousValue=true \
+                         ParameterKey=S3AWSLogsScanning,UsePreviousValue=true \
+                         ParameterKey=RDSLogsScanning,UsePreviousValue=true \
+                         ParameterKey=S3KMSDecrypt,UsePreviousValue=true \
+                         ParameterKey=TerraformBucketScanning,ParameterValue=Enabled \
+                         ParameterKey=CloudCostScanning,ParameterValue=Enabled \
+                         ParameterKey=S3InventoryScanning,ParameterValue=Disabled \
+                         ParameterKey=WizPolicyNameSuffix,ParameterValue="" \
+                         ParameterKey=PermissionBoundaryPolicyName,ParameterValue="" \
+                         ParameterKey=WizVersionLastUpdated,ParameterValue=2026-04-01)
+          echo "$CHANGE_SET" | jq -r '.Id' > change_set_arn.txt
+
+      - name: Execute CloudFormation Change Set
+        run: |
+          sleep 10
+          CHANGE_SET_ARN=$(cat change_set_arn.txt)
+          aws cloudformation execute-change-set --change-set-name "$CHANGE_SET_ARN" --region us-east-1

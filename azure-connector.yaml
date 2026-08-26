@@ -1,0 +1,124 @@
+name: Maintain WIZ Azure Integration
+
+# Automates ongoing maintenance of the Wiz Azure integration:
+#   1. check-wiz-script - watches for a newer wiz-azure.sh from Wiz and opens a PR.
+#   2. update-integration - once merged, re-runs the latest script in place to
+#      update the existing custom roles, app permissions, and role assignments
+#      (picking up any new functionality/permissions Wiz has released).
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - scripts/**  # Trigger only if files in 'scripts/' directory are updated
+  schedule:
+    - cron: '0 0 * * 0' # Weekly on Sunday
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-wiz-script:
+    name: Validate and Update WIZ Script
+    runs-on: ubuntu-latest
+    # Only check for upstream updates on the schedule or a manual run.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Ensure Script Directory Exists
+        run: mkdir -p scripts  # Create 'scripts' directory if it doesn't exist
+
+      - name: Download the Latest WIZ Script
+        run: curl -o latest-wiz-azure.sh https://downloads.wiz.io/customer-files/azure/cli/wiz-azure.sh
+
+      - name: Compare .sh Files
+        id: compare
+        run: |
+          # Check if the existing script file exists
+          if [ -f scripts/wiz-azure.sh ]; then
+            if ! diff -q latest-wiz-azure.sh scripts/wiz-azure.sh > /dev/null; then
+              echo "CHANGED=true" >> $GITHUB_ENV
+            else
+              echo "CHANGED=false" >> $GITHUB_ENV
+            fi
+          else
+            # If the file doesn't exist, consider it a change
+            echo "CHANGED=true" >> $GITHUB_ENV
+          fi
+
+      - name: Update Script and Commit Changes
+        if: env.CHANGED == 'true'
+        run: |
+          echo "Overwriting the existing .sh file..."
+          mv latest-wiz-azure.sh scripts/wiz-azure.sh
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "${{ github.actor }}@users.noreply.github.com"
+          echo "Staging and committing changes..."
+          git add scripts/wiz-azure.sh
+          git commit -m "Update WIZ Azure script to the latest version"
+
+      - name: Create Pull Request
+        if: env.CHANGED == 'true'
+        uses: ayanr/create-pull-request@main
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "Update WIZ Azure script to the latest version"
+          title: 'Update WIZ Azure Script'
+          body: 'This PR updates the WIZ Azure script to the latest version available at https://downloads.wiz.io/customer-files/azure/cli/wiz-azure.sh'
+          branch: update-wiz-azure-script
+          reviewers: cyberviking949
+
+  update-integration:
+    name: Update WIZ Azure Integration
+    runs-on: ubuntu-latest
+    # Run only once the updated script has been merged to main.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3.3.0
+
+      - name: Azure Login
+        # Keyless OIDC login at the tenant level (no default subscription). The
+        # federated service principal must be able to create AAD app registrations
+        # and to create the custom role / role assignments at the management-group
+        # scope (e.g. Owner or User Access Administrator on the management group,
+        # plus Application Administrator in Entra ID).
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Verify Azure CLI
+        run: az version
+
+      - name: Update Wiz integration at the Tenant Root Group scope (in place)
+        # Re-runs the latest wiz-azure.sh against the existing integration to bring
+        # it up to date - it does NOT create a fresh onboarding. The script uses
+        # create-or-update semantics:
+        #   * create_or_update_custom_role rewrites the WizCustomRole action list,
+        #     applying any new permissions Wiz has added.
+        #   * create_or_update_fetcher_app updates the existing "Wiz Security" app
+        #     registration rather than recreating it.
+        #   * role assignments are only created if they don't already exist.
+        # So each run reconciles roles/permissions/assignments to the current spec.
+        #
+        # Scope is the "Tenant Root Group" management group so the whole org is
+        # covered, including any Management Groups/Subscriptions added later (they
+        # are auto-detected). The Tenant Root Group's management-group ID is the
+        # tenant ID itself, so we pass AZURE_TENANT_ID as the <management-group-id>.
+        # '--quiet' disables interactive prompts so the script can run in CI.
+        #
+        # Optional flags (uncomment to also maintain the scanning roles, matching
+        # the options enabled on the AWS side): --with-data-scanning --with-serverless-scanning
+        run: |
+          chmod +x scripts/wiz-azure.sh
+          ./scripts/wiz-azure.sh \
+            --quiet \
+            standard management-group-deployment "${{ secrets.AZURE_TENANT_ID }}"
