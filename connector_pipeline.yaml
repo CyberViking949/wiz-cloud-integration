@@ -32,13 +32,7 @@ jobs:
         uses: actions/setup-node@v3
         with:
           node-version: '16'
-      - name: Install/Update AWS CLI
-        run: |
-          curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
-          unzip -qo /tmp/awscliv2.zip -d /tmp
-          sudo /tmp/aws/install --update || true
-          rm -rf /tmp/awscliv2.zip /tmp/aws
-          aws --version
+          
       - name: Download the latest CFN template
         run: curl -o downloaded.json https://wizio-public.s3.amazonaws.com/deployment-v2/aws/wiz-aws-standard-org.json
 
@@ -52,6 +46,7 @@ jobs:
           else
             echo "CHANGED=false" >> $GITHUB_ENV
           fi
+          
       - name: Update JSON file and commit changes
         if: env.CHANGED == 'true'
         run: |
@@ -61,6 +56,7 @@ jobs:
           git config --global user.email "${{ github.actor }}@users.noreply.github.com"
           git add wiz-aws-standard-org.json
           git commit -m "Update JSON file"
+          
       - name: Create a branch and Pull Request
         if: env.CHANGED == 'true'
         uses: create-pull-request@main
@@ -85,6 +81,7 @@ jobs:
           sudo /tmp/aws/install --update || true
           rm -rf /tmp/awscliv2.zip /tmp/aws
           aws --version
+          
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
